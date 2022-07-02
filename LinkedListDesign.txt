@@ -1,0 +1,66 @@
+A distributed, horizontally scalable, best ordering, dead-lock free, space/cost optimized, Linked List built on top of DynamoDB
+
+#Introduction:
+DynamoDB allows to store key value efficiently with strong consistency and consistent partitioning on the primary key.
+We have the need to represents the data in form of a linked-list, and we want to benefits from the same guarantee as dynamo (availability, consistency, latency…).
+So we built this facade on top. Each linked list is represented by multiple “page”. 
+
+The first page of a LinkedList contains a pointer to the current last “page” of the linkedlist (where new items should be appended), it is called the “summary” page.
+The next pages, also called “data page” contains the data appended to the linkedlist. Each page can contain an array of item and can store between 0 to N item.
+N needs to be set by calling “configureMaximumNumberOfElementPerPage“.
+The goal of putting together those items in the same node is to not have to create a new dynamo element for each writes. Why? because we want to avoid to have to update the pointer in the summary page too often. This avoid doing too much random access write on the summary page, which on top of being slower, will be a “hotspot” prone to bug at scale. N threads using the linkedlist could increment the page summary in the same time which would lead to a lot of “blank” page.
+This linkedlist incorporate automatic retries to dynamo and don’t use any blocking mechanism (C-A-S only).
+
+#Warnings
+- Because of race condition, the append algorithm is doing only a “best” effort ordering, which mean you can have value that is slightly (few seconds) older in a later page than the current page (just ignore, or reorder time client side).
+- A page can be empty, or not well initialized. It is by design due to concurrent calls. If so, just ignore it and keep iterating through pages to retrieve data.
+- Your client can be throttled (4XX Error), listen for that and retry late with exponential back off.
+
+#Exceptions
+createNewPageException
+dynamoNotAvailable
+pageNotFound
+
+#Public Methods
+configureDynamoDb(config)
+This is to initialize the DB name and region you will be targeting.
+
+configureMaximumNumberOfElementPerPage(numberOfMaximumElement): 
+This function is to optimize how much a data can be added by “page”.
+If page == 1 (which is the minimum) it will create a new dynamodb item for each node in the linkedlist. 
+This will most likely not react well at scale (empty page, pointer incremented too much…).
+
+The goal is to put as much data as possible in a single page but:
+- The size should not go being the maximum dynamo item size (which is 400 KB)
+- BulkRetrieve in dynamo is limited to 16 000KB. You will most likely want to retrieve linkedlist in bulk, so keep this in mind.
+- Each page contains 1KB of metadata
+- Concurrent threads can be trying to add in the same page despite the limit being reached! It should be small window of few seconds when this happen, but my advice would be to over provisioning by assuming the maximum size of the dynamo DB item is 200kb (and then tune things up or down depending on the scale)
+
+So for example, if the maximum size of an entry is 3 000 bytes (1000 for the text in UTF8, 2000 for metadata like scope).
+The maximum size of a page should be: 1KB + 3kb * N <= 400KB, N should be less than 100ish.
+Then we apply the over-provisioning factor of /2, so we limit ourself to 50 elements.
+
+idempotentCreate(id):
+This will create the first summary page. This operation is idempotent.
+
+atomicAppend(id, value):
+If the page does not exists it first atomically incrementing the pointer to point to the “current” page.
+This pointer might be incremented as the same time as another thread which is why you can have “blank” page that you should ignore.
+It then creates the new page by using the CAS mechanism. If the page get has been created in between, it just fails silently.
+Then it finally append the value (or directly append if the page was already created) by inserting the data into the page atomically.
+This operation is not idempotent and could insert duplicates due to retries.
+
+atomicBulkAppendBulk([id, values]):
+Not implemented
+
+getCurrentPage(id):
+This retrieve what is the current page (which is also the ‘last’ page) on which you should write (or stop reading).
+
+retrieve(id, page):
+This retrieve the entire content of a page and return all the elements contained into it.
+
+bulkRetrieve([id, pageId]):
+Same as retrieve, but in bulk. It will silently fail if a page is not found.
+
+retrieveLastMostRecent(numberOfItems) and retrieveNextMostRecent:
+It will retrieve the top N most (or the next N most) recent item that has been appended to the linkedlist. numberOfItems can’t be bigger than the maximum allowed number of element per page.
